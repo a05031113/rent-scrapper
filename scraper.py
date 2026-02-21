@@ -4,6 +4,9 @@
 - 整層住家、2房以上、≤30000、有電梯、非頂加、近捷運
 - Telegram Bot 通知
 - GitHub Actions 定時執行
+
+591 已改為 Nuxt.js SSR 架構，搜尋結果內嵌於 __NUXT__.data，
+因此改用 Playwright 渲染頁面後從 JS context 擷取資料。
 """
 
 import os
@@ -15,6 +18,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
+from playwright.sync_api import sync_playwright, BrowserContext, Page
 
 # ── Logging ──────────────────────────────────────────────
 logging.basicConfig(
@@ -56,137 +60,100 @@ SEARCH_CONFIGS = [
     },
 ]
 
-# 共用搜尋參數
+# 共用搜尋 URL 參數（對應 591 Nuxt SSR 路由）
 COMMON_PARAMS = {
-    "kind": 1,           # 整層住家
-    "multiRoom": "2,3,4",  # 2房以上
+    "kind": "1",              # 整層住家
+    "layout": "2,3,4",        # 2房以上（舊名 multiRoom）
     "rentprice": "0,30000",
     "other": "lift,not_cover,near_subway",  # 電梯、非頂加、近捷運
-    "order": "posttime",   # 最新刊登排序
+    "order": "posttime",      # 最新刊登排序
     "orderType": "desc",
-    "firstRow": 0,
-    "totalRows": 0,
 }
 
-LIST_API = "https://rent.591.com.tw/home/search/rsList"
-DETAIL_URL_TPL = "https://rent.591.com.tw/rent-detail-{id}.html"
+BASE_URL = "https://rent.591.com.tw/list"
 
-# ── Helper: 取得 CSRF token + cookies ────────────────────
-def get_session() -> requests.Session:
-    """建立帶有合法 cookies 和 CSRF token 的 session"""
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-    })
-
-    # 先造訪首頁取得 cookies（最多重試 3 次）
-    resp = None
-    for attempt in range(3):
-        try:
-            resp = sess.get("https://rent.591.com.tw/", timeout=15)
-            resp.raise_for_status()
-            break
-        except Exception as e:
-            logger.warning("首頁請求失敗 (第 %d 次): %s", attempt + 1, e)
-            if attempt == 2:
-                raise RuntimeError(f"無法連線 591 首頁，已重試 3 次: {e}") from e
-            time.sleep(2 ** attempt)
-
-    # 從 HTML 中擷取 csrf-token
-    html = resp.text
-    token = ""
-    marker = 'name="csrf-token" content="'
-    idx = html.find(marker)
-    if idx != -1:
-        start = idx + len(marker)
-        end = html.find('"', start)
-        token = html[start:end]
-
-    if not token:
-        # 備援：嘗試從 X-CSRF-TOKEN cookie 取得
-        token = sess.cookies.get("X-CSRF-TOKEN", "")
-
-    if token:
-        sess.headers["X-CSRF-TOKEN"] = token
-        logger.info("CSRF token 取得成功")
-    else:
-        logger.warning("無法取得 CSRF token，可能影響 API 呼叫")
-
-    return sess
+# JS 腳本：從 __NUXT__.data 擷取搜尋結果
+EXTRACT_NUXT_JS = """() => {
+    const d = window.__NUXT__ && window.__NUXT__.data;
+    if (!d) return null;
+    for (const v of Object.values(d)) {
+        const inner = v && v.data;
+        if (inner && inner.items && Array.isArray(inner.items)) {
+            return {
+                items: inner.items,
+                total: inner.total,
+                firstRow: inner.firstRow,
+            };
+        }
+    }
+    return null;
+}"""
 
 
-# ── Helper: 設定 region cookie ───────────────────────────
-def set_region_cookie(sess: requests.Session, region: int):
-    """設定 urlJumpIp cookie 以匹配搜尋 region"""
-    sess.cookies.set("urlJumpIp", str(region), domain=".591.com.tw")
-
-
-# ── 搜尋房源 ─────────────────────────────────────────────
-def fetch_listings(sess: requests.Session, config: dict) -> list[dict]:
-    """呼叫 591 API 搜尋並回傳所有結果"""
-    set_region_cookie(sess, config["region"])
-
+# ── Playwright 搜尋 ─────────────────────────────────────
+def fetch_listings_pw(context: BrowserContext, config: dict) -> list[dict]:
+    """用 Playwright 造訪搜尋頁面，從 __NUXT__ 擷取房源列表"""
     params = {**COMMON_PARAMS}
-    params["region"] = config["region"]
+    params["region"] = str(config["region"])
     params["section"] = config["section"]
-    params["firstRow"] = 0
 
-    all_items = []
-    max_pages = 5  # 安全上限，避免爬太多頁
+    all_items: list[dict] = []
+    max_pages = 5
 
-    for page in range(max_pages):
-        params["firstRow"] = page * 30
-        logger.info(
-            "搜尋 %s | page=%d (firstRow=%d)",
-            config["label"], page + 1, params["firstRow"],
-        )
+    page: Page = context.new_page()
 
-        try:
-            resp = sess.get(LIST_API, params=params, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.error("API 呼叫失敗: %s", e)
-            break
+    try:
+        for page_num in range(max_pages):
+            first_row = page_num * 30
+            if first_row > 0:
+                params["firstRow"] = str(first_row)
+            elif "firstRow" in params:
+                del params["firstRow"]
 
-        records = data.get("records", "0")
-        if isinstance(records, str):
-            records = int(records) if records.isdigit() else 0
+            query = "&".join(f"{k}={v}" for k, v in params.items())
+            url = f"{BASE_URL}?{query}"
 
-        items = []
-        # 591 API 回傳結構可能是 data.data 或直接 data
-        raw_data = data.get("data", {})
-        if isinstance(raw_data, dict):
-            items = raw_data.get("data", [])
-        elif isinstance(raw_data, list):
-            items = raw_data
+            logger.info(
+                "搜尋 %s | page=%d (firstRow=%d)",
+                config["label"], page_num + 1, first_row,
+            )
 
-        if not items:
-            logger.info("第 %d 頁無資料，結束", page + 1)
-            break
+            try:
+                page.goto(url, wait_until="networkidle", timeout=30000)
+            except Exception as e:
+                logger.error("頁面載入失敗: %s", e)
+                break
 
-        all_items.extend(items)
-        logger.info("取得 %d 筆 (累計 %d / %d)", len(items), len(all_items), records)
+            # 從 __NUXT__ 擷取資料
+            data = page.evaluate(EXTRACT_NUXT_JS)
 
-        # 已經拿完了
-        if records > 0 and len(all_items) >= records:
-            break
+            if not data or not data.get("items"):
+                logger.info("第 %d 頁無資料，結束", page_num + 1)
+                break
 
-        # 禮貌性延遲 2~4 秒
-        delay = random.uniform(2.0, 4.0)
-        time.sleep(delay)
+            items = data["items"]
+            total = int(data.get("total", 0)) if data.get("total") else 0
+            all_items.extend(items)
+            logger.info(
+                "取得 %d 筆 (累計 %d / %d)",
+                len(items), len(all_items), total,
+            )
+
+            if total > 0 and len(all_items) >= total:
+                break
+
+            # 禮貌性延遲
+            time.sleep(random.uniform(2.0, 4.0))
+    finally:
+        page.close()
 
     return all_items
 
 
 # ── 解析單一房源 ─────────────────────────────────────────
 def parse_listing(item: dict) -> dict:
-    """將 591 API 原始資料轉成統一格式"""
-    listing_id = str(item.get("id", item.get("post_id", "")))
+    """將 591 Nuxt SSR 資料轉成統一格式"""
+    listing_id = str(item.get("id", ""))
     price = item.get("price", "")
     if isinstance(price, str):
         price = price.replace(",", "")
@@ -196,16 +163,14 @@ def parse_listing(item: dict) -> dict:
         "id": listing_id,
         "title": item.get("title", ""),
         "price": price,
-        "address": item.get("address", item.get("location", "")),
-        "area": item.get("area", ""),
-        "floor": item.get("floor_str", item.get("floor", "")),
+        "address": item.get("address", ""),
+        "area": item.get("area_name", item.get("area", "")),
+        "floor": item.get("floor_name", ""),
         "kind_name": item.get("kind_name", "整層住家"),
-        "room": item.get("room", ""),
-        "section_name": item.get("section_name", item.get("sectionName", "")),
-        "region_name": item.get("region_name", item.get("regionName", "")),
-        "url": DETAIL_URL_TPL.format(id=listing_id),
-        "photo": item.get("photo_list", [None])[0] if item.get("photo_list") else item.get("cover", ""),
-        "post_time": item.get("post_time", item.get("updatetime", "")),
+        "room": item.get("layoutStr", ""),
+        "url": item.get("url", f"https://rent.591.com.tw/{listing_id}"),
+        "photo": item.get("cover", ""),
+        "refresh_time": item.get("refresh_time", ""),
     }
 
 
@@ -260,11 +225,11 @@ def format_listing_message(listing: dict) -> str:
     parts = [
         f"🏠 <b>{listing['title']}</b>",
         f"💰 {price_str} 元/月",
-        f"📍 {listing.get('region_name', '')} {listing.get('section_name', '')} {listing['address']}",
+        f"📍 {listing['address']}",
     ]
 
     if listing.get("area"):
-        parts.append(f"📐 {listing['area']} 坪")
+        parts.append(f"📐 {listing['area']}")
     if listing.get("floor"):
         parts.append(f"🏢 {listing['floor']}")
     if listing.get("room"):
@@ -281,62 +246,70 @@ def main():
     logger.info("=== 591 租屋監控啟動 (%s) ===", now)
 
     try:
-        # 1. 建立 session
-        sess = get_session()
-        time.sleep(random.uniform(1.0, 2.0))
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+
+            try:
+                # 1. 載入已看過的 ID
+                seen_ids = load_seen_ids()
+                logger.info("已記錄 %d 筆歷史房源", len(seen_ids))
+
+                # 2. 搜尋每個區域
+                new_listings = []
+
+                for config in SEARCH_CONFIGS:
+                    items = fetch_listings_pw(context, config)
+                    for item in items:
+                        listing = parse_listing(item)
+                        if not listing["id"]:
+                            continue
+                        if listing["id"] in seen_ids:
+                            continue
+                        # 雙重確認價格
+                        if isinstance(listing["price"], int) and (listing["price"] <= 0 or listing["price"] > 30000):
+                            continue
+                        new_listings.append(listing)
+                        seen_ids.add(listing["id"])
+
+                    # 區域之間延遲
+                    time.sleep(random.uniform(2.0, 3.0))
+
+                # 3. 通知
+                if new_listings:
+                    logger.info("發現 %d 筆新房源！", len(new_listings))
+
+                    # 最多一次通知 10 筆，避免洗版
+                    batch = new_listings[:10]
+                    for listing in batch:
+                        msg = format_listing_message(listing)
+                        send_telegram(msg)
+                        time.sleep(1.1)  # Telegram rate limit: max 1 msg/sec
+
+                    if len(new_listings) > 10:
+                        send_telegram(f"⚠️ 還有 {len(new_listings) - 10} 筆新房源，請上 591 查看完整列表。")
+                else:
+                    logger.info("沒有新房源")
+
+                # 4. 儲存已看過的 ID
+                save_seen_ids(seen_ids)
+                logger.info("=== 執行完畢 ===")
+
+            except Exception as e:
+                logger.error("執行過程發生錯誤: %s", e, exc_info=True)
+                send_telegram(f"🚨 591 爬蟲執行錯誤\n{e}")
+            finally:
+                browser.close()
+
     except Exception as e:
-        logger.error("Session 建立失敗: %s", e)
-        send_telegram(f"🚨 591 爬蟲故障：無法建立 session\n{e}")
-        return
-
-    try:
-        # 2. 載入已看過的 ID
-        seen_ids = load_seen_ids()
-        logger.info("已記錄 %d 筆歷史房源", len(seen_ids))
-
-        # 3. 搜尋每個區域
-        new_listings = []
-
-        for config in SEARCH_CONFIGS:
-            items = fetch_listings(sess, config)
-            for item in items:
-                listing = parse_listing(item)
-                if not listing["id"]:
-                    continue
-                if listing["id"] in seen_ids:
-                    continue
-                # 雙重確認價格
-                if isinstance(listing["price"], int) and (listing["price"] <= 0 or listing["price"] > 30000):
-                    continue
-                new_listings.append(listing)
-                seen_ids.add(listing["id"])
-
-            # 區域之間延遲
-            time.sleep(random.uniform(2.0, 3.0))
-
-        # 4. 通知
-        if new_listings:
-            logger.info("發現 %d 筆新房源！", len(new_listings))
-
-            # 最多一次通知 10 筆，避免洗版
-            batch = new_listings[:10]
-            for listing in batch:
-                msg = format_listing_message(listing)
-                send_telegram(msg)
-                time.sleep(1.1)  # Telegram rate limit: max 1 msg/sec
-
-            if len(new_listings) > 10:
-                send_telegram(f"⚠️ 還有 {len(new_listings) - 10} 筆新房源，請上 591 查看完整列表。")
-        else:
-            logger.info("沒有新房源")
-
-        # 5. 儲存已看過的 ID
-        save_seen_ids(seen_ids)
-        logger.info("=== 執行完畢 ===")
-
-    except Exception as e:
-        logger.error("執行過程發生錯誤: %s", e, exc_info=True)
-        send_telegram(f"🚨 591 爬蟲執行錯誤\n{e}")
+        logger.error("Playwright 啟動失敗: %s", e)
+        send_telegram(f"🚨 591 爬蟲故障：無法啟動瀏覽器\n{e}")
 
 
 if __name__ == "__main__":
