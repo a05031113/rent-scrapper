@@ -1,0 +1,43 @@
+name: 591 Rent Monitor
+
+on:
+  schedule:
+    # 每天台灣時間 8:00, 12:00, 18:00, 22:00 執行
+    # GitHub Actions 用 UTC，台灣 = UTC+8
+    - cron: "0 0,4,10,14 * * *"
+  workflow_dispatch: # 手動觸發
+
+permissions:
+  contents: write  # 需要 push seen_ids.json
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scraper.py
+
+      - name: Commit seen_ids.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_ids.json
+          git diff --cached --quiet || git commit -m "chore: update seen_ids [skip ci]"
+          git pull --rebase
+          git push
