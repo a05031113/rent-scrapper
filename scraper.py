@@ -1,7 +1,8 @@
 """
 591 租屋監控爬蟲
 - 台北市（排除內湖、北投）+ 新北永和、三重
-- 整層住家、2房以上、≤30000、非頂加、近捷運（無電梯限3樓以下）
+- 整層住家、2房以上、≤30000、10~50坪、非頂加、近捷運、可開伙
+- 設備：冷氣、洗衣機、冰箱 ｜ 無電梯限3樓以下
 - Telegram Bot 通知
 - GitHub Actions 定時執行
 
@@ -64,10 +65,12 @@ SEARCH_CONFIGS = [
 # 共用搜尋 URL 參數（對應 591 Nuxt SSR 路由）
 COMMON_PARAMS = {
     "kind": "1",              # 整層住家
-    "layout": "2,3,4",        # 2房以上（舊名 multiRoom）
+    "layout": "2,3,4",        # 2房以上
     "rentprice": "0,30000",
-    "other": "not_cover,near_subway",  # 非頂加、近捷運（電梯改為後篩選）
-    "order": "posttime",      # 最新刊登排序
+    "area": "10,50",           # 10~50坪
+    "other": "not_cover,near_subway,cook",  # 非頂加、近捷運、可開伙（電梯改為後篩選）
+    "option": "cold,washer,icebox",         # 有冷氣、有洗衣機、有冰箱
+    "order": "posttime",       # 最新刊登排序
     "orderType": "desc",
 }
 
