@@ -1,7 +1,7 @@
 """
 591 租屋監控爬蟲
 - 台北市（排除內湖、北投）+ 新北永和、三重
-- 整層住家、2房以上、≤30000、有電梯、非頂加、近捷運
+- 整層住家、2房以上、≤30000、非頂加、近捷運（無電梯限3樓以下）
 - Telegram Bot 通知
 - GitHub Actions 定時執行
 
@@ -33,6 +33,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # 已通知過的房源 ID 檔案路徑
 SEEN_FILE = Path(__file__).parent / "seen_ids.json"
+PENDING_FILE = Path(__file__).parent / "pending_listings.json"
 
 # ── 591 區域 / 行政區 ID 對照 ────────────────────────────
 # 台北市 region=1
@@ -65,7 +66,7 @@ COMMON_PARAMS = {
     "kind": "1",              # 整層住家
     "layout": "2,3,4",        # 2房以上（舊名 multiRoom）
     "rentprice": "0,30000",
-    "other": "lift,not_cover,near_subway",  # 電梯、非頂加、近捷運
+    "other": "not_cover,near_subway",  # 非頂加、近捷運（電梯改為後篩選）
     "order": "posttime",      # 最新刊登排序
     "orderType": "desc",
 }
@@ -151,6 +152,18 @@ def fetch_listings_pw(context: BrowserContext, config: dict) -> list[dict]:
 
 
 # ── 解析單一房源 ─────────────────────────────────────────
+def _parse_floor(floor_name: str) -> int:
+    """從 '4F/8F' 格式取得所在樓層數字，解析失敗回傳 0"""
+    if not floor_name:
+        return 0
+    part = floor_name.split("/")[0].strip().upper()
+    # 處理 B1F 等地下室
+    if part.startswith("B"):
+        return 0
+    digits = "".join(c for c in part if c.isdigit())
+    return int(digits) if digits else 0
+
+
 def parse_listing(item: dict) -> dict:
     """將 591 Nuxt SSR 資料轉成統一格式"""
     listing_id = str(item.get("id", ""))
@@ -159,15 +172,25 @@ def parse_listing(item: dict) -> dict:
         price = price.replace(",", "")
         price = int(price) if price.isdigit() else 0
 
+    tags = item.get("tags", [])
+    floor_name = item.get("floor_name", "")
+
+    area_num = item.get("area", 0)
+    if isinstance(area_num, str):
+        area_num = float(area_num) if area_num.replace(".", "").isdigit() else 0
+
     return {
         "id": listing_id,
         "title": item.get("title", ""),
         "price": price,
         "address": item.get("address", ""),
         "area": item.get("area_name", item.get("area", "")),
-        "floor": item.get("floor_name", ""),
+        "area_num": float(area_num),
+        "floor": floor_name,
+        "floor_num": _parse_floor(floor_name),
         "kind_name": item.get("kind_name", "整層住家"),
         "room": item.get("layoutStr", ""),
+        "has_elevator": "有電梯" in tags,
         "url": item.get("url", f"https://rent.591.com.tw/{listing_id}"),
         "photo": item.get("cover", ""),
         "refresh_time": item.get("refresh_time", ""),
@@ -191,6 +214,35 @@ def save_seen_ids(ids: set):
     SEEN_FILE.write_text(
         json.dumps(recent, ensure_ascii=False),
         encoding="utf-8",
+    )
+
+
+def load_pending_listings() -> list[dict]:
+    if PENDING_FILE.exists():
+        try:
+            return json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def save_pending_listings(listings: list[dict]):
+    PENDING_FILE.write_text(
+        json.dumps(listings, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def sort_listings(listings: list[dict]) -> list[dict]:
+    """排序：上架時間（ID 大 = 新）> 坪數大 > 租金低"""
+    return sorted(
+        listings,
+        key=lambda l: (
+            int(l["id"]) if l["id"].isdigit() else 0,
+            l.get("area_num", 0),
+            -l.get("price", 0),
+        ),
+        reverse=True,
     )
 
 
@@ -231,7 +283,8 @@ def format_listing_message(listing: dict) -> str:
     if listing.get("area"):
         parts.append(f"📐 {listing['area']}")
     if listing.get("floor"):
-        parts.append(f"🏢 {listing['floor']}")
+        elevator = "有電梯" if listing.get("has_elevator") else "無電梯"
+        parts.append(f"🏢 {listing['floor']}（{elevator}）")
     if listing.get("room"):
         parts.append(f"🛏 {listing['room']}")
 
@@ -275,27 +328,49 @@ def main():
                         # 雙重確認價格
                         if isinstance(listing["price"], int) and (listing["price"] <= 0 or listing["price"] > 30000):
                             continue
+                        # 無電梯且樓層 > 3 則跳過
+                        if not listing["has_elevator"] and listing["floor_num"] > 3:
+                            continue
+                        # 排除開放式格局
+                        if listing.get("room") and "開放式" in listing["room"]:
+                            continue
+                        # 坪數至少 15 坪
+                        if listing.get("area_num", 0) < 15:
+                            continue
                         new_listings.append(listing)
                         seen_ids.add(listing["id"])
 
                     # 區域之間延遲
                     time.sleep(random.uniform(2.0, 3.0))
 
-                # 3. 通知
-                if new_listings:
-                    logger.info("發現 %d 筆新房源！", len(new_listings))
+                # 3. 合併待推播 + 新房源，排序後推播前 10 筆
+                pending = load_pending_listings()
+                if pending:
+                    logger.info("載入 %d 筆待推播房源", len(pending))
 
-                    # 最多一次通知 10 筆，避免洗版
-                    batch = new_listings[:10]
+                all_to_send = pending + new_listings
+                all_to_send = sort_listings(all_to_send)
+
+                if all_to_send:
+                    logger.info("共 %d 筆待推播（新 %d + 上次剩餘 %d）",
+                                len(all_to_send), len(new_listings), len(pending))
+
+                    batch = all_to_send[:10]
+                    remaining = all_to_send[10:]
+
                     for listing in batch:
                         msg = format_listing_message(listing)
                         send_telegram(msg)
-                        time.sleep(1.1)  # Telegram rate limit: max 1 msg/sec
+                        time.sleep(1.1)  # Telegram rate limit
 
-                    if len(new_listings) > 10:
-                        send_telegram(f"⚠️ 還有 {len(new_listings) - 10} 筆新房源，請上 591 查看完整列表。")
+                    if remaining:
+                        logger.info("剩餘 %d 筆留待下次推播", len(remaining))
+                        save_pending_listings(remaining)
+                    else:
+                        save_pending_listings([])
                 else:
                     logger.info("沒有新房源")
+                    save_pending_listings([])
 
                 # 4. 儲存已看過的 ID
                 save_seen_ids(seen_ids)
